@@ -799,26 +799,33 @@ async function roadRoundtripFallback(coord, distKm){
 // ══════════════════════════════════════════
 async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
 
+  // ── TUNING-KONSTANTE ──────────────────────────────────────────────────────
+  // Wegpunkte liegen bei (distKm * DIST_FACTOR) km Entfernung vom Start.
+  // Faustregel: 0.25 = kompaktes Dreieck, 0.35 = großzügigere Schleifen.
+  // Empfehlung: mit 50/80/100 km Routen testen und ggf. anpassen.
+  const DIST_FACTOR = 0.28;
+  // ─────────────────────────────────────────────────────────────────────────
+
   // Winkel-Offset basierend auf S.seed → jede Neu-Berechnung dreht das Dreieck etwas
   // Moduliert zwischen 0° und 119° (volle Drehung = neues Dreieck, nicht nur Spiegelung)
   const seedAngle = (S.seed % 120);
 
-  // Zieldistanz: Wegpunkte sollen ca. 28% der Gesamtdistanz vom Start entfernt sein.
-  // Begründung: Bei einem gleichseitigen Dreieck mit Umfang U sind die Seiten U/3 lang.
-  // Start → WP1 → WP2 → WP3 → Start ≈ 4 Seiten → WP-Distanz ≈ totalDist / 4 ≈ 0.25
-  // +10% Puffer wegen Straßenführung → 0.28 als empirisch guter Wert.
-  const targetDist = distKm * 0.28;
+  const targetDist = distKm * DIST_FACTOR;
 
   // Zwei Overpass-Queries parallel:
-  // Query A: Straßen MIT explizitem surface=asphalt/paved/concrete (bevorzugt)
-  // Query B (nur wenn !strictMode): Straßen ohne Surface-Tag (secondary/tertiary haben oft keins)
+  // Query A: bevorzugte Rennrad-Straßen MIT explizitem surface=asphalt/paved/concrete
+  //   → secondary/tertiary/cycleway/primary (residential bewusst ausgelassen)
+  // Query B (nur wenn !strictMode): gleiche Typen OHNE Surface-Tag (in DE oft nicht getaggt)
+  //   + residential nur hier als Fallback-Pool, nicht in Query A
   const qA = `[out:json][timeout:20];(
-    way["highway"~"^(secondary|tertiary|residential|cycleway)$"]["surface"~"^(asphalt|paved|concrete)$"](around:${rm},${la},${lo});
+    way["highway"~"^(secondary|tertiary|cycleway)$"]["surface"~"^(asphalt|paved|concrete)$"](around:${rm},${la},${lo});
     way["highway"="primary"]["surface"~"^(asphalt|paved|concrete)$"](around:${rm},${la},${lo});
   );out center qt 300;`;
 
   const qB = `[out:json][timeout:20];(
     way["highway"~"^(secondary|tertiary)$"][!"surface"](around:${rm},${la},${lo});
+    way["highway"="cycleway"][!"surface"](around:${rm},${la},${lo});
+    way["highway"="residential"]["surface"~"^(asphalt|paved|concrete)$"](around:${rm},${la},${lo});
     way["highway"="residential"][!"surface"](around:${rm},${la},${lo});
   );out center qt 200;`;
 
@@ -833,26 +840,31 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
     )
   );
 
-  // Pool A: asphaltiert (höhere Qualität)
+  // Pool A: bevorzugte Straßentypen mit expliziter Asphalt-Oberfläche
   let poolA = [];
   if(results[0].status === 'fulfilled'){
     poolA = results[0].value.elements
       .filter(e => e.center || (e.lat && e.lon))
       .map(e => ({
         coord: e.center ? [e.center.lon, e.center.lat] : [e.lon, e.lat],
-        quality: 'asphalt'   // explizit asphaltiert
+        quality: 'asphalt'
       }));
   }
 
-  // Pool B: untagged secondary/tertiary/residential (mittlere Qualität)
+  // Pool B: secondary/tertiary ohne Surface-Tag + residential als Fallback
   let poolB = [];
   if(!strictMode && results[1]?.status === 'fulfilled'){
     poolB = results[1].value.elements
       .filter(e => e.center || (e.lat && e.lon))
-      .map(e => ({
-        coord: e.center ? [e.center.lon, e.center.lat] : [e.lon, e.lat],
-        quality: 'untagged'
-      }));
+      .map(e => {
+        const hw = e.tags?.highway || '';
+        // Qualitätsstufen: residential bekommt niedrigeren Score-Bonus als tertiary/cycleway
+        const quality = (hw === 'residential') ? 'residential' : 'untagged';
+        return {
+          coord: e.center ? [e.center.lon, e.center.lat] : [e.lon, e.lat],
+          quality
+        };
+      });
   }
 
   // Zu wenige Kandidaten? Fehler werfen damit Fallback greift
@@ -869,10 +881,12 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
     const targetAngle = (seedAngle + i * 120) % 360;
 
     // Scoring-Funktion:
-    //   - angleDiff: Abweichung vom Zielwinkel (0°–180°)
-    //   - distDiff:  Abweichung von der Zieldistanz
-    //   - score:     0–1, höher = besser
-    //   - Asphalt-Bonus: +0.05 für explizit asphaltierte Straßen
+    //   - angleDiff:  Abweichung vom Zielwinkel (0°–180°)
+    //   - distScore:  Gaußförmig um targetDist
+    //   - Qualitäts-Bonus nach Straßentyp:
+    //       asphalt     +0.15  (secondary/tertiary/cycleway explizit asphaltiert)
+    //       untagged    +0.05  (secondary/tertiary ohne Surface-Tag)
+    //       residential  0.00  (Wohngebiet — nur wenn nichts Besseres verfügbar)
     const scored = [...poolA, ...poolB]
       .map(({ coord, quality }) => {
         const [cLo, cLa] = coord;
@@ -883,22 +897,24 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
         const angleDiff = Math.abs(((bearing - targetAngle + 540) % 360) - 180);
 
         // Distanz-Fenster: 20%–180% der Zieldistanz
-        // Außerhalb: Kandidat wird ignoriert
         if(angleDiff > 55) return null;
         if(dist < targetDist * 0.20) return null;
         if(dist > targetDist * 1.80) return null;
 
         // Distanz-Score: Gaußförmig um Zieldistanz
-        // → Kandidaten direkt auf targetDist bekommen Score 1.0
         const distRatio = dist / targetDist;
         const distScore = Math.exp(-2.5 * Math.pow(distRatio - 1, 2));
 
         // Winkel-Score: linear, 0° Abweichung = 1.0, 55° Abweichung = 0.0
         const angleScore = 1 - (angleDiff / 55);
 
+        // Qualitäts-Bonus
+        const qualityBonus = quality === 'asphalt' ? 0.15
+                           : quality === 'untagged' ? 0.05
+                           : 0.00; // residential
+
         // Gesamtscore: Winkel etwas wichtiger als Distanz
-        const score = angleScore * 0.55 + distScore * 0.45
-          + (quality === 'asphalt' ? 0.05 : 0);
+        const score = angleScore * 0.55 + distScore * 0.45 + qualityBonus;
 
         return { coord, score, dist };
       })
