@@ -1018,8 +1018,12 @@ async function queryForestWps(la, lo, rm, distKm){
   const secondary = tracks;
   const targetDist = distKm / 4;
 
+  // Seed-basierter Winkel-Offset: analog zu queryRoadWps()
+  // → jede neue Variante (newVariant) dreht das Dreieck anders
+  const seedAngle = (S.seed % 120);
+
   const wps = [0, 1, 2].map(i => {
-    const angle = (i * 120 + 30) % 360;
+    const angle = (seedAngle + i * 120) % 360;
 
     const best = (pool) => {
       const cands = pool.filter(([fLo, fLa]) => {
