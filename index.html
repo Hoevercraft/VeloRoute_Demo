@@ -1246,7 +1246,7 @@ function showResults(f){
   const mins = Math.round(sum.duration/60);
   const h=Math.floor(mins/60), m=mins%60;
   const timeStr = h ? `${h}h ${m.toString().padStart(2,'0')}m` : `${m} min`;
-  let ascent=0; segs.forEach(s=>{ ascent+=s.ascend||0; });
+  let ascent=0; segs.forEach(s=>{ ascent+=s.ascent||0; });
   const cls = S.hot?'shade':(S.bike==='hardcore'?'hardcore':S.bike);
 
   ['sD','sE','sT'].forEach(id=>{ q(id).className='sv '+cls; });
