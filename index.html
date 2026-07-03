@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="de">
 <head>
@@ -761,6 +762,10 @@ async function planRoute(){
 // ══════════════════════════════════════════
 async function graphhopper(body){
   const key = sanitize(S.keyGH);
+  // custom_model erfordert lt. GH-Doku zwingend "ch.disable": true im Body
+  // (Speed Mode / Contraction Hierarchies unterstützen keine custom_models).
+  // Zentral hier gesetzt, damit es in keinem Codepfad vergessen werden kann.
+  body = { 'ch.disable': true, ...body };
   const res = await fetch(`https://graphhopper.com/api/1/route?key=${encodeURIComponent(key)}`, {
     method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -1414,7 +1419,15 @@ async function gravelRoundtrip(coord, distKm, vias = []){
     try { fill = await queryForestWps(la, lo, radius, distKm, budget, vias); } catch(e){}
   }
   setStatus('Berechne Gravel-Route…');
-  return waypoints([coord, ...sortByBearing([...vias, ...fill], coord), coord]);
+  if(fill.length){
+    try {
+      return await waypoints([coord, ...sortByBearing([...vias, ...fill], coord), coord]);
+    } catch(e){
+      // Füll-Wegpunkt nicht routbar → reiner Via-Loop (Pflichtpunkte bleiben garantiert)
+      setStatus('Berechne Route über Zwischenziele…');
+    }
+  }
+  return waypoints([coord, ...sortByBearing(vias, coord), coord]);
 }
 
 async function waypoints(coords){
@@ -1437,9 +1450,13 @@ async function waypoints(coords){
       custom_model: hardcoreGravelCustomModel()
     });
   } else {
+    // Kein profile_params: green/quiet-Weightings gelten lt. ORS-Doku nur für
+    // foot-*-Profile. Bei cycling-mountain führten sie zum Request-Fehler —
+    // bisher unbemerkt, weil dieser Pfad nur von planShade() in try/catch
+    // genutzt wurde und still auf round_trip zurückfiel.
     return ors('cycling-mountain',{
       coordinates:coords,
-      options:{ avoid_features:['steps','ferries'], profile_params:{ weightings:{ green:0.6, quiet:0.3 } } },
+      options:{ avoid_features:['steps','ferries'] },
       elevation:true
     });
   }
