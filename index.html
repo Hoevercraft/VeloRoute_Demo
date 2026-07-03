@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="de">
 <head>
@@ -762,10 +761,19 @@ async function planRoute(){
 // ══════════════════════════════════════════
 async function graphhopper(body){
   const key = sanitize(S.keyGH);
-  // custom_model erfordert lt. GH-Doku zwingend "ch.disable": true im Body
-  // (Speed Mode / Contraction Hierarchies unterstützen keine custom_models).
-  // Zentral hier gesetzt, damit es in keinem Codepfad vergessen werden kann.
-  body = { 'ch.disable': true, ...body };
+  // GH Free Plan: flexibler Modus (ch.disable=true) ist gesperrt, custom_model
+  // erfordert aber genau diesen Modus. Konsequenz: Punkt-zu-Punkt-Requests
+  // (Wegpunkte/Vias) dürfen KEIN custom_model mitsenden — sonst wirft die API
+  // "custom_model ... not supported for speed mode" bzw. mit ch.disable=true
+  // "Free packages cannot use flexible mode". Nur algorithm=round_trip
+  // akzeptiert das custom_model (belegtes Live-Verhalten).
+  // Qualitätssicherung bei Punkt-zu-Punkt übernimmt validateRoadSurface()
+  // (Rennrad) im Post-Processing. Bei einem Plan-Upgrade kann dieser Strip
+  // entfallen und stattdessen 'ch.disable': true gesetzt werden.
+  if(body.algorithm !== 'round_trip' && body.custom_model){
+    body = { ...body };
+    delete body.custom_model;
+  }
   const res = await fetch(`https://graphhopper.com/api/1/route?key=${encodeURIComponent(key)}`, {
     method:'POST',
     headers:{'Content-Type':'application/json'},
