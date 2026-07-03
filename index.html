@@ -55,6 +55,22 @@ header{height:54px;background:var(--panel);border-bottom:1px solid var(--border)
 .ico-btn:hover{border-color:var(--accent);color:var(--accent)}
 .pill{display:none;margin-top:8px;padding:7px 10px;background:var(--accent-dim);border:1px solid rgba(34,197,94,.25);border-radius:7px;font-size:12px;color:var(--accent);line-height:1.3}
 
+/* Zwischenziele (Pflicht-Wegpunkte) */
+.via-row{position:relative;display:flex;gap:6px;margin-bottom:7px}
+.via-row .txt{padding-left:31px}
+.via-row.ok .txt{border-color:rgba(245,158,11,.55)}
+.via-num{position:absolute;left:9px;top:11px;width:16px;height:16px;background:var(--warm);color:#000;border-radius:50%;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;pointer-events:none;z-index:2}
+.ac{position:absolute;top:calc(100% + 4px);left:0;right:44px;background:var(--card);border:1px solid var(--border);border-radius:8px;z-index:600;max-height:190px;overflow-y:auto;display:none;box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.ac.on{display:block}
+.ac-item{padding:8px 11px;font-size:12px;cursor:pointer;border-bottom:1px solid var(--border);line-height:1.35}
+.ac-item:last-child{border-bottom:none}
+.ac-item:hover{background:var(--accent-dim)}
+.ac-sub{color:var(--muted);font-size:11px}
+.add-via{width:100%;padding:8px;background:var(--card);border:1px dashed var(--border);color:var(--muted);border-radius:var(--r);font-family:inherit;font-size:12px;cursor:pointer;transition:all .2s}
+.add-via:hover{border-color:var(--warm);color:var(--warm)}
+.note{display:none;margin-top:8px;padding:7px 10px;background:var(--warm-dim);border:1px solid rgba(245,158,11,.3);border-radius:7px;font-size:12px;color:#fde68a;line-height:1.4}
+.note.on{display:block}
+
 /* Bike cards */
 .bike-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .bike-card{padding:12px 8px;background:var(--card);border:2px solid var(--border);border-radius:var(--r);cursor:pointer;text-align:center;transition:all .2s;display:flex;flex-direction:column;align-items:center;gap:5px}
@@ -197,6 +213,15 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
       <div class="err" id="locErr"></div>
     </div>
 
+    <!-- Zwischenziele (optional, max. 3 Pflicht-Wegpunkte) -->
+    <div class="sb">
+      <div class="sb-lbl">Zwischenziele <span style="letter-spacing:0;text-transform:none;color:var(--warm)">· optional</span></div>
+      <div id="viaList"></div>
+      <button class="add-via" id="viaAdd" onclick="addVia()">+ Zwischenziel hinzufügen (max. 3)</button>
+      <div class="note" id="viaNote"></div>
+      <div class="err" id="viaErr"></div>
+    </div>
+
     <!-- Fahrradtyp -->
     <div class="sb">
       <div class="sb-lbl">Fahrradtyp</div>
@@ -326,6 +351,8 @@ const S = {
   tile: 'osm',
   rg: null,
   sm: null,
+  vias: [],   // Zwischenziele: { q, coord:[lon,lat]|null, name }
+  vg: null,   // Leaflet-LayerGroup für Via-Marker (unabhängig von rg)
 };
 function rnd(){ return Math.floor(Math.random()*9999); }
 function sanitize(v){ return v.replace(/[^ -~]/g,'').trim(); }
@@ -345,6 +372,7 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   S.rg = L.layerGroup().addTo(S.map);
+  S.vg = L.layerGroup().addTo(S.map);
 
   if(S.keyGH){  q('apiInGH').value = S.keyGH;  dotGH('ok');  }
   if(S.keyORS){ q('apiIn').value   = S.keyORS; dotORS('ok'); }
@@ -452,10 +480,218 @@ function placeStart(){
 }
 
 // ══════════════════════════════════════════
+// ZWISCHENZIELE (Pflicht-Wegpunkte, max. 3)
+//
+// Geocoding: Photon (photon.komoot.io) — erlaubt explizit Autocomplete.
+// Nominatim bleibt bewusst nur für den Startpunkt (Policy: kein Autosuggest).
+//
+// Datenmodell: S.vias = [{ q, coord:[lon,lat]|null, name }]
+//  - q:     aktueller Eingabetext
+//  - coord: gesetzt sobald ein Vorschlag gewählt/aufgelöst wurde
+//  - name:  aufgelöster Anzeigename
+//
+// Ohne Zwischenziele bleibt das komplette Routing-Verhalten unverändert.
+// ══════════════════════════════════════════
+const VIA_MAX = 3;
+let acTimer = null;
+
+function addVia(){
+  if(S.vias.length >= VIA_MAX) return;
+  S.vias.push({ q:'', coord:null, name:'' });
+  renderVias();
+  const inputs = document.querySelectorAll('#viaList .txt');
+  if(inputs.length) inputs[inputs.length-1].focus();
+}
+
+function removeVia(i){
+  S.vias.splice(i, 1);
+  renderVias(); placeVias();
+  err('viaErr',''); note('viaNote','');
+}
+
+function renderVias(){
+  const list = q('viaList');
+  list.innerHTML = S.vias.map((v, i) => `
+    <div class="via-row${v.coord ? ' ok' : ''}">
+      <span class="via-num">${i+1}</span>
+      <input type="text" class="txt" value="${esc(v.coord ? v.name : v.q)}"
+        placeholder="Adresse oder Ort…"
+        oninput="viaInput(${i}, this.value)"
+        onkeydown="viaKey(event, ${i})"
+        onblur="setTimeout(()=>hideAc(${i}), 200)">
+      <button class="ico-btn" title="Entfernen" onclick="removeVia(${i})">✕</button>
+      <div class="ac" id="ac${i}"></div>
+    </div>`).join('');
+  q('viaAdd').style.display = S.vias.length >= VIA_MAX ? 'none' : 'block';
+}
+
+function viaInput(i, val){
+  const v = S.vias[i]; if(!v) return;
+  v.q = val; v.coord = null; v.name = '';
+  clearTimeout(acTimer);
+  if(val.trim().length < 3){ hideAc(i); return; }
+  acTimer = setTimeout(() => photonSuggest(i, val.trim()), 300);
+}
+
+function viaKey(e, i){
+  if(e.key === 'Enter'){
+    e.preventDefault();
+    const first = q('ac'+i)?.querySelector('.ac-item');
+    if(first) first.click();
+  }
+  if(e.key === 'Escape') hideAc(i);
+}
+
+async function photonSuggest(i, qs){
+  try {
+    let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(qs)}&limit=5&lang=de`;
+    if(S.coord) url += `&lat=${S.coord[1]}&lon=${S.coord[0]}`; // Bias Richtung Startpunkt
+    const r = await fetch(url);
+    if(!r.ok) return;
+    const d = await r.json();
+    const box = q('ac'+i); if(!box) return;
+    const feats = (d.features || []).filter(f => f.geometry?.coordinates);
+    if(!feats.length){ box.classList.remove('on'); return; }
+    S._ac = S._ac || {};
+    S._ac[i] = feats;
+    box.innerHTML = feats.map((f, k) => {
+      const { main, sub } = photonLabel(f);
+      return `<div class="ac-item" onclick="pickVia(${i},${k})">${esc(main)}${sub ? `<div class="ac-sub">${esc(sub)}</div>` : ''}</div>`;
+    }).join('');
+    box.classList.add('on');
+  } catch{}
+}
+
+function pickVia(i, k){
+  const f = S._ac?.[i]?.[k];
+  const v = S.vias[i];
+  if(!f || !v) return;
+  const [lon, lat] = f.geometry.coordinates;
+  const { main, sub } = photonLabel(f);
+  v.coord = [lon, lat];
+  v.name  = sub ? `${main}, ${sub}` : main;
+  v.q     = v.name;
+  hideAc(i); renderVias(); placeVias();
+  err('viaErr','');
+}
+
+function hideAc(i){ const b = q('ac'+i); if(b) b.classList.remove('on'); }
+
+function photonLabel(f){
+  const p = f.properties || {};
+  const main = p.name
+    || [p.street, p.housenumber].filter(Boolean).join(' ')
+    || p.city || p.state || 'Unbenannter Ort';
+  const sub = [
+    p.postcode,
+    p.city && p.city !== main ? p.city : null,
+    !p.city && p.state && p.state !== main ? p.state : null
+  ].filter(Boolean).join(' ');
+  return { main, sub };
+}
+
+// Noch nicht aufgelöste Eingaben (Text ohne Auswahl) per Photon-Erstreffer auflösen.
+// Leere Felder werden ignoriert. Wirft bei Nichtauffindbarkeit mit klarer Meldung.
+async function resolveVias(){
+  const out = [];
+  for(let i = 0; i < S.vias.length; i++){
+    const v = S.vias[i];
+    if(v.coord){ out.push(v.coord); continue; }
+    if(!v.q.trim()) continue;
+    setStatus(`Löse Zwischenziel ${i+1} auf…`);
+    let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(v.q.trim())}&limit=1&lang=de`;
+    if(S.coord) url += `&lat=${S.coord[1]}&lon=${S.coord[0]}`;
+    let f = null;
+    try {
+      const r = await fetch(url);
+      if(r.ok){ const d = await r.json(); f = d.features?.[0] || null; }
+    } catch{}
+    if(!f?.geometry?.coordinates){
+      throw new Error(`Zwischenziel ${i+1} („${v.q}“) wurde nicht gefunden. Bitte präzisieren oder Vorschlag aus der Liste wählen.`);
+    }
+    const [lon, lat] = f.geometry.coordinates;
+    const { main, sub } = photonLabel(f);
+    v.coord = [lon, lat];
+    v.name  = sub ? `${main}, ${sub}` : main;
+    v.q     = v.name;
+    out.push(v.coord);
+  }
+  renderVias(); placeVias();
+  return out;
+}
+
+function placeVias(){
+  if(!S.vg) return;
+  S.vg.clearLayers();
+  S.vias.forEach((v, i) => {
+    if(!v.coord) return;
+    const icon = L.divIcon({
+      html:`<div style="width:20px;height:20px;background:#f59e0b;color:#000;border:2px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font:600 11px 'DM Sans',sans-serif;box-shadow:0 0 0 3px rgba(245,158,11,.3),0 2px 8px rgba(0,0,0,.5)">${i+1}</div>`,
+      className:'', iconSize:[20,20], iconAnchor:[10,10]
+    });
+    L.marker([v.coord[1], v.coord[0]], { icon }).addTo(S.vg)
+      .bindTooltip(esc(v.name), { direction:'top' });
+  });
+}
+
+// ── Geometrie-Helfer für Pflicht-Wegpunkte ──
+
+// Zwischenpunkte nach Peilung um den Startpunkt sortieren → sauberer Loop ohne Zickzack
+function sortByBearing(coords, center){
+  const [lo, la] = center;
+  return coords.slice().sort((a, b) =>
+    brng(la, lo, a[1], a[0]) - brng(la, lo, b[1], b[0])
+  );
+}
+
+// Untere Distanz-Schranke des Pflichtpunkt-Loops:
+// Luftlinie Start → (nach Winkel sortierte Vias) → Start, mal Umwegfaktor 1.3
+function viaMinKm(viaC){
+  if(!viaC.length || !S.coord) return 0;
+  const loop = [S.coord, ...sortByBearing(viaC, S.coord), S.coord];
+  let d = 0;
+  for(let i = 0; i < loop.length - 1; i++){
+    d += hav(loop[i][1], loop[i][0], loop[i+1][1], loop[i+1][0]);
+  }
+  return d * 1.3;
+}
+
+// Zielwinkel für generierte Wegpunkte bestimmen.
+// Ohne Vias: seedAngle + gleichmäßige Verteilung (budget=3 → exakt das bisherige
+// 0°/120°/240°-Dreieck). Mit Vias: iterativ die Mitte der jeweils größten
+// Winkellücke zwischen allen bereits belegten Peilungen füllen → generierte
+// Punkte landen dort, wo die Pflichtpunkte den Kreis noch nicht abdecken.
+function fillAngles(viaBearings, budget, seedAngle){
+  if(budget <= 0) return [];
+  if(!viaBearings.length){
+    return Array.from({ length: budget }, (_, i) => (seedAngle + i * (360 / budget)) % 360);
+  }
+  const placed = viaBearings.slice();
+  const out = [];
+  for(let n = 0; n < budget; n++){
+    const all = placed.slice().sort((a, b) => a - b);
+    let bestGap = -1, bestMid = 0;
+    for(let i = 0; i < all.length; i++){
+      const a = all[i], b = all[(i + 1) % all.length];
+      const gap = ((b - a + 360) % 360) || 360; // eine einzige Peilung → volle 360°-Lücke
+      if(gap > bestGap){ bestGap = gap; bestMid = (a + gap / 2) % 360; }
+    }
+    out.push(bestMid);
+    placed.push(bestMid);
+  }
+  return out;
+}
+
+// ══════════════════════════════════════════
 // ROUTE PLANNING
 // Rennrad  → GraphHopper eigene Wegpunkte via queryRoadWps()
 // Gravel   → ORS (cycling-mountain)
 // Hardcore → GraphHopper eigene Wegpunkte via queryForestWps()
+//
+// Zwischenziele (S.vias) werden als Pflicht-Wegpunkte in alle Profile
+// gemischt. GraphHopper Free Plan erlaubt max. 5 Locations pro Request,
+// daher gilt für generierte Wegpunkte ein Budget von (3 − Anzahl Vias):
+// [Start] + [Vias + generierte Wps ≤ 3] + [Start] = max. 5 Punkte. ✓
 // ══════════════════════════════════════════
 async function planRoute(){
   if((S.bike==='road'||S.bike==='hardcore') && !S.keyGH){
@@ -467,26 +703,46 @@ async function planRoute(){
     return;
   }
   if(!S.coord){ err('routeErr','Bitte zuerst einen Startpunkt wählen.'); return; }
-  err('routeErr',''); loading(true);
+  err('routeErr',''); err('viaErr',''); note('viaNote',''); loading(true);
 
   try {
+    // ── Zwischenziele auflösen (Pflicht-Wegpunkte) ──
+    let viaC = [];
+    try { viaC = await resolveVias(); }
+    catch(e){ err('viaErr', e.message); return; }
+
+    // Plausibilität: Pflichtpunkte definieren eine untere Distanz-Schranke.
+    // Ist die Zieldistanz kleiner, wird sie transparent angehoben statt eine
+    // unmögliche Vorgabe in die Retry-Schleife zu geben.
+    let effTarget = S.dist;
+    const minKm = viaMinKm(viaC);
+    if(minKm > S.dist){
+      effTarget = Math.ceil(minKm / 5) * 5;
+      note('viaNote', `⚠️ Zieldistanz für die Zwischenziele zu klein — Route wird ca. ${effTarget} km lang.`);
+    }
+
     // ── Distanz-kontrollierte Retry-Schleife ──
     const MAX_OVER_KM = 10;
     const MAX_TRIES   = 2;
-    let hintDist = S.dist;
+    let hintDist = effTarget;
     let feature;
 
     for(let attempt = 0; attempt < MAX_TRIES; attempt++){
       if(attempt > 0) await new Promise(r => setTimeout(r, 1000));
       setStatus(attempt === 0 ? 'Berechne Route…' : `Passe Distanz an… (${hintDist.toFixed(0)} km)`);
-      const raw = S.hot ? await planShade() : await roundtrip(S.coord, hintDist);
+      const raw = S.hot ? await planShade(viaC) : await roundtrip(S.coord, hintDist, viaC);
       setStatus('Bereinige Route…');
       feature = cleanRoute(raw);
 
       const actualKm = feature.properties.summary.distance / 1000;
-      if(actualKm <= S.dist + MAX_OVER_KM) break;
+      if(actualKm <= effTarget + MAX_OVER_KM) break;
 
-      const scaled = Math.max(10, hintDist * (S.dist / actualKm));
+      // Bei 3 Pflichtpunkten existieren keine generierten Wegpunkte mehr,
+      // die sich anpassen ließen → Retry wäre ein identischer Request.
+      if(viaC.length >= 3) break;
+
+      // Nie unter die Pflichtpunkt-Mindestdistanz skalieren
+      const scaled = Math.max(10, minKm, hintDist * (effTarget / actualKm));
       if(Math.abs(scaled - hintDist) < 1) break;
       hintDist = scaled;
     }
@@ -669,9 +925,11 @@ function hardcoreGravelCustomModel(){
 //
 // Strategie:
 //  1. Overpass: asphaltierte Straßen im Radius laden
-//  2. queryRoadWps() wählt 3 Wegpunkte aus (Winkel-Logik)
-//  3. GraphHopper verbindet: [start, wp1, wp2, wp3, start]
-//  4. Fallback: Wenn Overpass scheitert → round_trip Algorithmus
+//  2. queryRoadWps() wählt bis zu (3 − Vias) Wegpunkte aus (Winkel-Logik)
+//  3. GraphHopper verbindet: [start, …Vias+Wps nach Peilung sortiert…, start]
+//  4. Fallback ohne Vias: Overpass scheitert → round_trip Algorithmus
+//     Fallback mit Vias:  reiner Via-Loop (round_trip kann Pflichtpunkte
+//     nicht garantieren und ist daher mit Vias tabu)
 //
 // Wegpunkt-Auswahl-Logik (queryRoadWps):
 //  - Zielwinkel: 0°, 120°, 240° (gleichmäßiges Dreieck)
@@ -682,7 +940,7 @@ function hardcoreGravelCustomModel(){
 //  - Diversität: Kandidaten müssen mind. 2 km voneinander entfernt sein
 //  - Seed-Variation: Pro Neuberechnung (newVariant) anderer Startwinkel-Offset
 // ══════════════════════════════════════════
-async function roadRoundtrip(coord, distKm){
+async function roadRoundtrip(coord, distKm, vias = []){
   const [lo, la] = coord;
 
   // Radius: so groß wie nötig um alle 3 Wegpunkte zu finden,
@@ -690,61 +948,81 @@ async function roadRoundtrip(coord, distKm){
   // Wegpunkte liegen bei ~dist*0.28 km Entfernung → Radius = dist*0.35 km
   const radius = Math.min(Math.round(distKm * 350), 60000); // max 60 km
 
-  setStatus('Suche Rennrad-Straßen…');
+  // Budget für generierte Wegpunkte: GH Free Plan = max. 5 Locations/Request
+  // → Start + (Vias + generierte) + Start ≤ 5 → generierte ≤ 3 − Vias
+  const budget = Math.max(0, 3 - vias.length);
 
   let roadWps = [];
-  try {
-    roadWps = await queryRoadWps(la, lo, radius, distKm);
-  } catch(e) {
-    // Overpass nicht erreichbar → direkt Fallback
-    console.warn('queryRoadWps fehlgeschlagen:', e.message);
+  if(budget > 0){
+    setStatus('Suche Rennrad-Straßen…');
+    try {
+      roadWps = await queryRoadWps(la, lo, radius, distKm, false, budget, vias);
+    } catch(e) {
+      // Overpass nicht erreichbar → direkt Fallback
+      console.warn('queryRoadWps fehlgeschlagen:', e.message);
+    }
   }
 
-  if(roadWps.length >= 2){
-    // ── Hauptpfad: eigene Wegpunkte ──
+  // GH-Request über Wegpunkte + Surface-Check (gemeinsamer Baustein)
+  const routeVia = async (wps) => {
+    const res = await graphhopper({
+      points: [coord, ...sortByBearing(wps, coord), coord],
+      profile: 'bike',
+      points_encoded: false,
+      elevation: true,
+      details: ['surface','road_class'],
+      custom_model: roadCustomModel()
+    });
+    res._check = validateRoadSurface(res.ghPath||{});
+    return res;
+  };
+
+  // Mit Vias reicht 1 Gesamtpunkt (Pflicht!), ohne Vias wie bisher min. 2 generierte
+  const combined = [...vias, ...roadWps];
+  if(combined.length >= (vias.length ? 1 : 2)){
+    // ── Hauptpfad: Pflichtpunkte + eigene Wegpunkte ──
     setStatus('Optimiere Rennrad-Route…');
     try {
-      const res = await graphhopper({
-        points: [coord, ...roadWps, coord],
-        profile: 'bike',
-        points_encoded: false,
-        elevation: true,
-        details: ['surface','road_class'],
-        custom_model: roadCustomModel()
-      });
-      const check = validateRoadSurface(res.ghPath||{});
-      if(check.ok) return res;
-      // Surface-Qualität nicht gut genug → zweiter Versuch mit neuen Wegpunkten
-      setStatus('Prüfe Oberflächen…');
-      await new Promise(r => setTimeout(r, 1000));
-      const roadWps2 = await queryRoadWps(la, lo, radius, distKm, true); // strictMode=true
-      if(roadWps2.length >= 2){
-        const res2 = await graphhopper({
-          points: [coord, ...roadWps2, coord],
-          profile: 'bike',
-          points_encoded: false,
-          elevation: true,
-          details: ['surface','road_class'],
-          custom_model: roadCustomModel()
-        });
-        const check2 = validateRoadSurface(res2.ghPath||{});
-        if(!check2.ok){
-          res2.surfaceWarning = true;
-          res2.surfaceDetail  = check2.detail;
+      const res = await routeVia(combined);
+      if(res._check.ok) return res;
+      // Surface-Qualität nicht gut genug → zweiter Versuch mit neuen generierten
+      // Wegpunkten (strictMode). Pflichtpunkte bleiben unangetastet.
+      if(budget > 0){
+        setStatus('Prüfe Oberflächen…');
+        await new Promise(r => setTimeout(r, 1000));
+        const roadWps2 = await queryRoadWps(la, lo, radius, distKm, true, budget, vias); // strictMode=true
+        if(roadWps2.length >= (vias.length ? 1 : 2)){
+          const res2 = await routeVia([...vias, ...roadWps2]);
+          if(!res2._check.ok){
+            res2.surfaceWarning = true;
+            res2.surfaceDetail  = res2._check.detail;
+          }
+          return res2;
         }
-        return res2;
       }
-      if(!check.ok){
-        res.surfaceWarning = true;
-        res.surfaceDetail  = check.detail;
-      }
+      res.surfaceWarning = true;
+      res.surfaceDetail  = res._check.detail;
       return res;
     } catch(e){
+      if(vias.length){
+        // Pflichtpunkte dürfen NIE verworfen werden → kein round_trip-Fallback.
+        // Stattdessen reiner Via-Loop ohne generierte Wegpunkte; scheitert auch
+        // der, wird der Fehler nach oben gereicht (planRoute zeigt ihn an).
+        if(!roadWps.length) throw e; // war bereits der reine Via-Loop
+        console.warn('Wegpunkt-Route fehlgeschlagen, versuche reinen Via-Loop:', e.message);
+        setStatus('Berechne Route über Zwischenziele…');
+        const res = await routeVia(vias);
+        if(!res._check.ok){
+          res.surfaceWarning = true;
+          res.surfaceDetail  = res._check.detail;
+        }
+        return res;
+      }
       console.warn('Wegpunkt-Route fehlgeschlagen, Fallback zu round_trip:', e.message);
     }
   }
 
-  // ── Fallback: round_trip Algorithmus ──
+  // ── Fallback: round_trip Algorithmus (nur ohne Pflichtpunkte erreichbar) ──
   setStatus('Verwende Fallback-Algorithmus…');
   return roadRoundtripFallback(coord, distKm);
 }
@@ -790,14 +1068,19 @@ async function roadRoundtripFallback(coord, distKm){
 //   rm          — Suchradius in Metern
 //   distKm      — Gewünschte Gesamtdistanz
 //   strictMode  — true: nur explizit asphaltierte Wege (kein surface=*)
+//   budget      — Anzahl zu generierender Wegpunkte (3 − Anzahl Vias)
+//   avoid       — Pflichtpunkt-Koordinaten [lon,lat]: bestimmen die Zielwinkel-
+//                 Lücken (fillAngles) und gelten in der Diversitätsprüfung
 //
 // Wegpunkt-Auswahl:
-//   Zielwinkel:   seedAngle + 0°, seedAngle + 120°, seedAngle + 240°
+//   Zielwinkel:   ohne Vias seedAngle + 0°/120°/240° (unverändert),
+//                 mit Vias Mitte der größten Winkellücken (fillAngles)
 //   Zieldistanz:  distKm * 0.28  (empirisch ermittelt für schöne Rundkurse)
 //   Score:        (1 - angleDiff/50) * 0.6 + (1 - distDiff/targetDist) * 0.4
-//   Diversität:   jeder neue Wegpunkt muss > 2 km von bereits gewählten entfernt sein
+//   Diversität:   jeder neue Wegpunkt muss > 2 km von bereits gewählten
+//                 Wegpunkten UND von Pflichtpunkten entfernt sein
 // ══════════════════════════════════════════
-async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
+async function queryRoadWps(la, lo, rm, distKm, strictMode = false, budget = 3, avoid = []){
 
   // ── TUNING-KONSTANTE ──────────────────────────────────────────────────────
   // Wegpunkte liegen bei (distKm * DIST_FACTOR) km Entfernung vom Start.
@@ -873,12 +1156,14 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
     throw new Error(`Zu wenige Straßen-Kandidaten: ${totalPool}`);
   }
 
-  // ── 3 Wegpunkte auswählen ──
-  // Für jeden der 3 Winkel (seedAngle + 0/120/240°) den besten Kandidaten wählen.
+  // ── Wegpunkte auswählen ──
+  // Zielwinkel: ohne Vias das bisherige seedAngle-Dreieck, mit Vias die
+  // Mitten der größten Winkellücken zwischen den Pflichtpunkt-Peilungen.
+  const viaBearings = avoid.map(([aLo, aLa]) => brng(la, lo, aLa, aLo));
+  const angles = fillAngles(viaBearings, budget, seedAngle);
   const wps = [];
 
-  for(let i = 0; i < 3; i++){
-    const targetAngle = (seedAngle + i * 120) % 360;
+  for(const targetAngle of angles){
 
     // Scoring-Funktion:
     //   - angleDiff:  Abweichung vom Zielwinkel (0°–180°)
@@ -923,12 +1208,13 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
 
     if(!scored.length) continue;
 
-    // Diversitätsprüfung: Wegpunkt muss mind. 2 km von bereits gewählten entfernt sein.
+    // Diversitätsprüfung: Wegpunkt muss mind. 2 km von bereits gewählten
+    // Wegpunkten UND von Pflichtpunkten entfernt sein.
     // Verhindert dass mehrere Wegpunkte im selben Ort landen.
     const MIN_WP_SEPARATION_KM = 2.0;
     let chosen = null;
     for(const candidate of scored){
-      const tooClose = wps.some(([wLo, wLa]) =>
+      const tooClose = [...avoid, ...wps].some(([wLo, wLa]) =>
         hav(wLa, wLo, candidate.coord[1], candidate.coord[0]) < MIN_WP_SEPARATION_KM
       );
       if(!tooClose){
@@ -946,28 +1232,45 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false){
 }
 
 // ══════════════════════════════════════════
-// HARDCORE ROUNDTRIP (unverändert)
+// HARDCORE ROUNDTRIP
 // ══════════════════════════════════════════
-async function hardcoreRoundtrip(coord, distKm){
+async function hardcoreRoundtrip(coord, distKm, vias = []){
   const [lo, la] = coord;
   const radius = Math.min(distKm * 200, 50000);
-  let forestWps = [];
-  setStatus('Suche Wald- & Feldwege…');
-  try { forestWps = await queryForestWps(la, lo, radius, distKm); } catch(e){}
 
-  if(forestWps.length >= 2){
+  // Budget für generierte Wegpunkte: GH Free Plan = max. 5 Locations/Request
+  const budget = Math.max(0, 3 - vias.length);
+
+  let forestWps = [];
+  if(budget > 0){
+    setStatus('Suche Wald- & Feldwege…');
+    try { forestWps = await queryForestWps(la, lo, radius, distKm, budget, vias); } catch(e){}
+  }
+
+  const hcVia = (wps) => graphhopper({
+    points: [coord, ...sortByBearing(wps, coord), coord],
+    profile: 'bike',
+    points_encoded: false,
+    elevation: true,
+    details: ['surface'],
+    custom_model: hardcoreGravelCustomModel()
+  });
+
+  const combined = [...vias, ...forestWps];
+  if(combined.length >= (vias.length ? 1 : 2)){
     setStatus('Optimiere Route durch Wald…');
     try {
-      return await graphhopper({
-        points: [coord, ...forestWps, coord],
-        profile: 'bike',
-        points_encoded: false,
-        elevation: true,
-        details: ['surface'],
-        custom_model: hardcoreGravelCustomModel()
-      });
-    } catch(e){}
+      return await hcVia(combined);
+    } catch(e){
+      if(vias.length){
+        // Pflichtpunkte dürfen NIE verworfen werden → kein round_trip-Fallback.
+        if(!forestWps.length) throw e; // war bereits der reine Via-Loop
+        setStatus('Berechne Route über Zwischenziele…');
+        return hcVia(vias);
+      }
+    }
   }
+  // Klassischer round_trip: nur ohne Pflichtpunkte erreichbar
   return graphhopper({
     points: [coord],
     profile: 'bike',
@@ -981,7 +1284,7 @@ async function hardcoreRoundtrip(coord, distKm){
   });
 }
 
-async function queryForestWps(la, lo, rm, distKm){
+async function queryForestWps(la, lo, rm, distKm, budget = 3, avoid = []){
   const qryForest = `[out:json][timeout:15];(
     way["landuse"="forest"](around:${rm},${la},${lo});
     way["natural"="wood"](around:${rm},${la},${lo});
@@ -1019,18 +1322,22 @@ async function queryForestWps(la, lo, rm, distKm){
   const targetDist = distKm / 4;
 
   // Seed-basierter Winkel-Offset: analog zu queryRoadWps()
-  // → jede neue Variante (newVariant) dreht das Dreieck anders
+  // → jede neue Variante (newVariant) dreht das Dreieck anders.
+  // Mit Pflichtpunkten (avoid) füllen die generierten Wegpunkte stattdessen
+  // die größten Winkellücken zwischen den Via-Peilungen (fillAngles).
   const seedAngle = (S.seed % 120);
+  const viaBearings = avoid.map(([aLo, aLa]) => brng(la, lo, aLa, aLo));
+  const angles = fillAngles(viaBearings, budget, seedAngle);
 
-  const wps = [0, 1, 2].map(i => {
-    const angle = (seedAngle + i * 120) % 360;
+  const wps = angles.map(angle => {
 
     const best = (pool) => {
       const cands = pool.filter(([fLo, fLa]) => {
         const b    = brng(la, lo, fLa, fLo);
         const dist = hav(la, lo, fLa, fLo);
         const angleDiff = Math.abs(((b - angle + 540) % 360) - 180);
-        return angleDiff < 55 && dist > targetDist * 0.3 && dist < targetDist * 2.5;
+        return angleDiff < 55 && dist > targetDist * 0.3 && dist < targetDist * 2.5
+          && !avoid.some(([aLo, aLa]) => hav(fLa, fLo, aLa, aLo) < 2);
       });
       if(!cands.length) return null;
       cands.sort((a, b_) =>
@@ -1070,12 +1377,19 @@ async function ors(profile, body){
 // ══════════════════════════════════════════
 // ROUNDTRIP DISPATCHER
 // ══════════════════════════════════════════
-async function roundtrip(coord, distKm){
+async function roundtrip(coord, distKm, vias = []){
   if(S.bike==='road'){
-    return roadRoundtrip(coord, distKm);
+    return roadRoundtrip(coord, distKm, vias);
   } else if(S.bike==='hardcore'){
-    return hardcoreRoundtrip(coord, distKm);
+    return hardcoreRoundtrip(coord, distKm, vias);
   } else {
+    return gravelRoundtrip(coord, distKm, vias);
+  }
+}
+
+async function gravelRoundtrip(coord, distKm, vias = []){
+  // Ohne Zwischenziele: unverändertes ORS round_trip
+  if(!vias.length){
     return ors('cycling-mountain',{
       coordinates:[coord],
       options:{
@@ -1086,6 +1400,21 @@ async function roundtrip(coord, distKm){
       elevation:true
     });
   }
+
+  // Mit Zwischenzielen: ORS options.round_trip akzeptiert nur genau eine
+  // Koordinate → manueller Loop über waypoints(). Füll-Wegpunkte kommen aus
+  // queryForestWps (Wald/Tracks — passt zum cycling-mountain-Charakter).
+  // Budget analog GH gedeckelt: konsistentes Verhalten über alle Profile.
+  const [lo, la] = coord;
+  const budget = Math.max(0, 3 - vias.length);
+  let fill = [];
+  if(budget > 0){
+    const radius = Math.min(distKm * 200, 50000);
+    setStatus('Suche Gravel-Wegpunkte…');
+    try { fill = await queryForestWps(la, lo, radius, distKm, budget, vias); } catch(e){}
+  }
+  setStatus('Berechne Gravel-Route…');
+  return waypoints([coord, ...sortByBearing([...vias, ...fill], coord), coord]);
 }
 
 async function waypoints(coords){
@@ -1119,25 +1448,35 @@ async function waypoints(coords){
 // ══════════════════════════════════════════
 // SHADE ROUTING
 // ══════════════════════════════════════════
-async function planShade(){
+async function planShade(vias = []){
   const [lo,la] = S.coord;
   const radius = Math.min(S.dist*180, 40000);
+
+  // Budget für Schatten-Wegpunkte: GH Free Plan = max. 5 Locations/Request
+  const budget = Math.max(0, 3 - vias.length);
+
   let shadePoints = [];
-  setStatus('Suche schattige Wege…');
-
-  if(S.bike==='road'){
-    try { shadePoints = await queryParks(la,lo,radius); } catch{}
-  } else {
-    try { shadePoints = await queryForests(la,lo,radius); } catch{}
-  }
-
-  if(shadePoints.length>=2){
-    const wps = pickShadeWps(lo,la,shadePoints,S.dist);
-    if(wps.length>=2){
-      try { return await waypoints([S.coord,...wps,S.coord]); } catch{}
+  if(budget > 0){
+    setStatus('Suche schattige Wege…');
+    if(S.bike==='road'){
+      try { shadePoints = await queryParks(la,lo,radius); } catch{}
+    } else {
+      try { shadePoints = await queryForests(la,lo,radius); } catch{}
     }
   }
-  return roundtrip(S.coord, S.dist);
+
+  let wps = [];
+  if(shadePoints.length >= 2 && budget > 0){
+    wps = pickShadeWps(lo, la, shadePoints, S.dist, budget, vias);
+  }
+
+  // Mit Vias reicht 1 Gesamtpunkt (Pflicht!), ohne Vias wie bisher min. 2
+  const combined = [...vias, ...wps];
+  if(combined.length >= (vias.length ? 1 : 2)){
+    try { return await waypoints([S.coord, ...sortByBearing(combined, S.coord), S.coord]); } catch{}
+  }
+  // Fallthrough: roundtrip() garantiert die Pflichtpunkte in allen Profilen
+  return roundtrip(S.coord, S.dist, vias);
 }
 
 async function queryParks(la,lo,rm){
@@ -1198,13 +1537,18 @@ async function queryForests(la,lo,rm){
   return d.elements.filter(e=>e.center||e.lat).map(e=>e.center?[e.center.lon,e.center.lat]:[e.lon,e.lat]);
 }
 
-function pickShadeWps(cLo,cLa,forests,distKm){
+function pickShadeWps(cLo,cLa,forests,distKm,budget=3,avoid=[]){
   const r = distKm/7;
-  return [0,1,2].map(s=>{
-    const min=s*120, max=(s+1)*120;
+  // Ohne Vias: 3 Winkel à 120° (entspricht den bisherigen Sektoren, nur als
+  // Winkelabstand statt Sektorgrenzen formuliert). Mit Vias: Lücken füllen.
+  const viaBearings = avoid.map(([aLo,aLa])=>brng(cLa,cLo,aLa,aLo));
+  const angles = fillAngles(viaBearings, budget, 60);
+  return angles.map(angle=>{
     const cands = forests.filter(([fLo,fLa])=>{
       const b=brng(cLa,cLo,fLa,fLo), d=hav(cLa,cLo,fLa,fLo);
-      return b>=min&&b<max&&d>r*.15&&d<r*3.5;
+      const angleDiff=Math.abs(((b-angle+540)%360)-180);
+      return angleDiff<60&&d>r*.15&&d<r*3.5
+        && !avoid.some(([aLo,aLa])=>hav(fLa,fLo,aLa,aLo)<2);
     });
     if(!cands.length) return null;
     cands.sort((a,b_)=>Math.abs(hav(cLa,cLo,a[1],a[0])-r)-Math.abs(hav(cLa,cLo,b_[1],b_[0])-r));
@@ -1305,14 +1649,18 @@ function exportGPX(){
     const ele = c.length>=3 ? `\n        <ele>${c[2].toFixed(1)}</ele>` : '';
     return `      <trkpt lat="${c[1].toFixed(7)}" lon="${c[0].toFixed(7)}">${ele}\n      </trkpt>`;
   }).join('\n');
+  const viasResolved = S.vias.filter(v => v.coord);
+  const wpts = viasResolved.map((v, i) =>
+    `  <wpt lat="${v.coord[1].toFixed(7)}" lon="${v.coord[0].toFixed(7)}">\n    <name>Zwischenziel ${i+1}: ${esc(v.name)}</name>\n  </wpt>`
+  ).join('\n');
   const gpx = `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="VeloRoute Planner" xmlns="http://www.topografix.com/GPX/1/1">
   <metadata>
     <name>${name}</name>
-    <desc>Fahrradtyp: ${label}${S.hot?' · Schattige Route':''}</desc>
+    <desc>Fahrradtyp: ${label}${S.hot?' · Schattige Route':''}${viasResolved.length?` · ${viasResolved.length} Zwischenziel${viasResolved.length>1?'e':''}`:''}</desc>
     <time>${new Date().toISOString()}</time>
   </metadata>
-  <trk>
+${wpts?wpts+'\n':''}  <trk>
     <name>${name}</name>
     <type>${S.bike==='road'?'cycling':S.bike==='hardcore'?'mountain_biking':'gravel_cycling'}</type>
     <trkseg>
@@ -1492,6 +1840,8 @@ function loading(on, msg){
 }
 function setStatus(msg){ loading(true, msg); }
 function err(id,msg){ const e=q(id); e.textContent=msg; e.classList.toggle('on',!!msg); }
+function note(id,msg){ const e=q(id); e.textContent=msg; e.classList.toggle('on',!!msg); }
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 </script>
 </body>
 </html>
