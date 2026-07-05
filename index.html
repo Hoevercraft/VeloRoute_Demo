@@ -676,7 +676,7 @@ function surfKey(tags){
 // damit die Indizes zur bereinigten Geometrie passen.
 function parseBRouterMessages(messages, coords){
   const rows = msgRows(messages);
-  const breakdown = {}, segs = [];
+  const breakdown = {}, segs = [], riskSegs = [];
   let prevIdx = 0;
   for(const row of rows){
     const key = surfKey(row.tags);
@@ -686,12 +686,22 @@ function parseBRouterMessages(messages, coords){
       const last = segs[segs.length - 1];
       if(last && last.key === key && last.to === prevIdx) last.to = idx;
       else segs.push({ from: prevIdx, to: idx, key });
+
+      // Risiko-Outline: nur nicht-sichere Stufen bekommen eine Farbe.
+      // Gleiche Merge-Bedingung (to === prevIdx) wie oben, damit eine
+      // safe-Lücke die farbige Linie sauber unterbricht.
+      const level = rowRisk(row.tags).level;
+      if(RISK[level].color){
+        const lr = riskSegs[riskSegs.length - 1];
+        if(lr && lr.level === level && lr.to === prevIdx) lr.to = idx;
+        else riskSegs.push({ from: prevIdx, to: idx, level });
+      }
     }
     prevIdx = Math.max(prevIdx, idx);
   }
   if(prevIdx < coords.length - 1 && segs.length)
     segs[segs.length - 1].to = coords.length - 1;
-  return { breakdown, segs, rows };
+  return { breakdown, segs, riskSegs, rows };
 }
 
 // Message-Koordinate (Mikrograd) → Index in der Track-Geometrie.
@@ -716,22 +726,65 @@ function matchIdx(coords, lonM, latM, startIdx){
 // SURFACE VALIDATOR (Rennrad, Post-Processing)
 // Arbeitet direkt auf den WayTags der BRouter-Segmente.
 // ══════════════════════════════════════════
+//
+// RISIKO-STUFEN — Single-Source-of-Truth für Validator UND Karte.
+// Farbe (Karten-Outline) und Gewicht (Anteil an der Risiko-Summe)
+// bewusst GETRENNT: z. B. „caution" ist gelb sichtbar, zählt aber
+// nur mit 0.05 — in DE sind viele Nebenstraßen ungetaggt, würden
+// sonst die 5-%-Warnung dauernd auslösen. color=null → keine Outline.
+const RISK = {
+  safe:    { w: 0.05, color: null,      label: 'unkritisch' },
+  caution: { w: 0.05, color: '#facc15', label: 'ungetaggt' },              // gelb
+  risky:   { w: 0.70, color: '#f97316', label: 'ungetaggte Hauptstraße' }, // orange
+  bad:     { w: 0.90, color: '#dc2626', label: 'unbefestigt' },            // rot
+  severe:  { w: 1.00, color: '#7f1d1d', label: 'grober Untergrund' },      // dunkelrot
+};
+
+const _SURF_PAVED  = new Set(['asphalt','paved','concrete','paving_stones']);
+const _SURF_SEVERE = new Set(['mud']);
+const _SURF_BAD    = new Set(['gravel','fine_gravel','ground','dirt','earth','sand','grass','compacted','unpaved','pebblestone']);
+const _HW_HARD     = new Set(['track','path','bridleway','footway','steps']);
+const _HW_RISKY    = new Set(['service','unclassified']);
+
+// Klassifiziert EIN BRouter-Segment anhand seiner WayTags.
+// Rückgabe:
+//   level  – Schlüssel in RISK (safe|caution|risky|bad|severe)
+//   hard   – true = unbefestigter Wegtyp → Route gilt als „nicht perfekt"
+//   reason – Freitext für Tooltip/Debug. NIE zum Verzweigen benutzen,
+//            sonst zieht die verstreute Logik wieder ein — immer gegen
+//            level/hard prüfen.
+function rowRisk(tags){
+  const s  = (tags.surface || '').toLowerCase().replace(/ /g, '_');
+  const hw = (tags.highway || '').toLowerCase();
+
+  // 1) Expliziter Belag schlägt alles
+  if(_SURF_SEVERE.has(s)) return { level:'severe', hard:false, reason:s };
+  if(_SURF_BAD.has(s))    return { level:'bad',    hard:false, reason:s };
+  if(_SURF_PAVED.has(s))  return { level:'safe',   hard:false, reason:s };
+
+  // 2) Unbefestigter Wegtyp ohne Belag-Tag → hart (kippt die Route)
+  if(_HW_HARD.has(hw))    return { level:'bad', hard:true, reason:hw+'_without_surface' };
+
+  // 3) Kein Belag-Tag: ungewisse größere Straße vs. gewöhnliche Straße
+  if(!s){
+    if(_HW_RISKY.has(hw)) return { level:'risky',   hard:false, reason:hw+'_without_surface' };
+    if(hw)               return { level:'caution', hard:false, reason:hw+'_without_surface' };
+    return { level:'caution', hard:false, reason:'no_tags' };
+  }
+
+  // 4) Getaggter, aber unbekannter Belag (wood, cobblestone, …) → mild
+  return { level:'caution', hard:false, reason:'surface_'+s };
+}
+
 function validateRoadSurface(rows){
   if(!rows.length) return { ok: true, riskPct: 0 };
-
-  const PAVED = new Set(['asphalt','paved','concrete','paving_stones']);
-  const BAD   = new Set(['gravel','fine_gravel','ground','dirt','earth','sand','grass','mud','compacted','unpaved','pebblestone']);
-  const HARD  = new Set(['track','path','bridleway','footway','steps']);
-  const RISKY = new Set(['service','unclassified']);
 
   let total = 0, risk = 0, hard = false, hardCls = '';
   for(const r of rows){
     const d = r.distM; total += d;
-    const s  = (r.tags.surface || '').toLowerCase();
-    const hw = r.tags.highway || '';
-    if(HARD.has(hw) && !PAVED.has(s)){ hard = true; hardCls = hw; risk += d; continue; }
-    if(BAD.has(s)){ risk += d * 0.9; continue; }
-    if(!s){ risk += RISKY.has(hw) ? d * 0.7 : d * 0.05; }
+    const rk = rowRisk(r.tags);
+    if(rk.hard){ hard = true; hardCls = (r.tags.highway || '').toLowerCase(); }
+    risk += d * RISK[rk.level].w;
   }
   const pct = total > 0 ? risk / total * 100 : 0;
   const MAX_RISK_PCT = 5;
@@ -1268,6 +1321,7 @@ function finishRoute(feature, viaC){
     const parsed = parseBRouterMessages(feature._messages, feature.geometry.coordinates);
     feature.properties.surfBreakdown = parsed.breakdown;
     feature.properties.surfSegs = parsed.segs;
+    feature.properties.riskSegs = parsed.riskSegs;
   }
   return feature;
 }
@@ -1736,8 +1790,23 @@ function renderRoute(feature, fit = true){
   const lls = coords.map(c=>[c[1],c[0]]);
   const col = routeColor();
   const segs = feature.properties.surfSegs || [];
+  const riskSegs = feature.properties.riskSegs || [];
 
   L.polyline(lls,{color:'rgba(0,0,0,.25)',weight:7,lineCap:'round',lineJoin:'round'}).addTo(S.rg);
+
+  // Risiko-Outline: breiter Farb-Halo UNTER der Belag-Farbe, nur im
+  // Rennrad-Belag-Modus. Belag-Info (dünnere Linie oben) bleibt lesbar,
+  // riskante Abschnitte leuchten je Stufe gelb/orange/rot/dunkelrot heraus.
+  if(S.colorSurf && S.bike === 'road' && riskSegs.length){
+    for(const rs of riskSegs){
+      const slice = lls.slice(rs.from, rs.to + 1);
+      if(slice.length < 2) continue;
+      L.polyline(slice,{
+        color: RISK[rs.level].color, weight:11, opacity:.9,
+        lineCap:'round', lineJoin:'round'
+      }).addTo(S.rg);
+    }
+  }
 
   if(S.colorSurf && segs.length){
     // Belag-Modus: jedes Segment in seiner Untergrund-Farbe
