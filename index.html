@@ -734,7 +734,7 @@ function matchIdx(coords, lonM, latM, startIdx){
 // sonst die 5-%-Warnung dauernd auslösen. color=null → keine Outline.
 const RISK = {
   safe:    { w: 0.05, color: null,      label: 'unkritisch' },
-  caution: { w: 0.05, color: '#facc15', label: 'ungetaggt' },              // gelb
+  caution: { w: 0.05, color: null,      label: 'ungetaggt' },              // keine Outline
   risky:   { w: 0.70, color: '#f97316', label: 'ungetaggte Hauptstraße' }, // orange
   bad:     { w: 0.90, color: '#dc2626', label: 'unbefestigt' },            // rot
   severe:  { w: 1.00, color: '#7f1d1d', label: 'grober Untergrund' },      // dunkelrot
