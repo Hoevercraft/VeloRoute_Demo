@@ -1278,11 +1278,18 @@ async function planRoute(){
       note('viaNote', `⚠️ Zieldistanz für die Zwischenziele zu klein — Route wird ca. ${effTarget} km lang.`);
     }
 
-    // ── Distanz-kontrollierte Retry-Schleife ──
-    const MAX_OVER_KM = 10;
-    const MAX_TRIES   = 2;
+    // ── Distanz-kontrollierte Retry-Schleife (symmetrisch) ──
+    // Akzeptanz-Band um effTarget: nicht zu lang (+MAX_OVER_KM) UND nicht
+    // zu kurz (>= UNDER_FACTOR·effTarget). Liegt actualKm außerhalb, wird
+    // hintDist proportional korrigiert — nach OBEN bei Untermaß, nach UNTEN
+    // bei Übermaß (früher nur abwärts). Von allen Versuchen wird die Route
+    // mit der kleinsten Abweichung behalten, nicht einfach die letzte.
+    const MAX_OVER_KM  = 10;    // Toleranz nach oben (km)
+    const UNDER_FACTOR = 0.90;  // Toleranz nach unten (Anteil des Ziels)
+    const MAX_TRIES    = 3;
     let hintDist = effTarget;
     let feature;
+    let best = null;            // { feature, dev, actualKm } — kleinste Abweichung
 
     for(let attempt = 0; attempt < MAX_TRIES; attempt++){
       if(attempt > 0) await new Promise(r => setTimeout(r, 600));
@@ -1292,15 +1299,25 @@ async function planRoute(){
       feature = finishRoute(raw, viaC);
 
       const actualKm = feature.properties.summary.distance / 1000;
-      if(actualKm <= effTarget + MAX_OVER_KM) break;
+
+      // Beste bisherige Route merken (kleinste absolute Abweichung vom Ziel)
+      const dev = Math.abs(actualKm - effTarget);
+      if(!best || dev < best.dev) best = { feature, dev, actualKm };
+
+      // Im Band → fertig
+      if(actualKm >= effTarget * UNDER_FACTOR && actualKm <= effTarget + MAX_OVER_KM) break;
 
       // Bei 3 Pflichtpunkten existieren keine generierten Wegpunkte mehr → Retry sinnlos
       if(viaC.length >= 3) break;
 
+      // Symmetrische Korrektur: actualKm < Ziel → hoch, actualKm > Ziel → runter
       const scaled = Math.max(10, minKm, hintDist * (effTarget / actualKm));
       if(Math.abs(scaled - hintDist) < 1) break;
       hintDist = scaled;
     }
+
+    // Band evtl. nie exakt getroffen → beste Näherung statt letztem Versuch
+    feature = best.feature;
 
     S.route = feature;
     renderRoute(feature);
@@ -1587,7 +1604,7 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false, budget = 3, 
   const wps = [];
 
   for(const { targetAngle, scored } of perAngle){
-    if(!scored.length) continue;
+    // Idealpunkt dieser Richtung am Zielradius — auch geometrischer Fallback
     const ideal = destPoint(la, lo, targetDist, targetAngle);
 
     const finals = scored.map(c => {
@@ -1610,7 +1627,19 @@ async function queryRoadWps(la, lo, rm, distKm, strictMode = false, budget = 3, 
       );
       if(!tooClose){ chosen = cand.coord; break; }
     }
-    if(!chosen && finals.length > 0) chosen = finals[0].coord;
+
+    // KEIN Dropout mehr: liefert diese Richtung keinen (separierten) Overpass-
+    // Kandidaten, wird der geometrische Idealpunkt am Zielradius gesetzt.
+    // BRouter snappt ihn auf den nächsten routbaren Weg — die Schleife bleibt
+    // gleichmäßig über alle Zielwinkel verteilt statt einseitig zu kollabieren.
+    // Die Idealpunkte liegen winkelmäßig weit auseinander und sind damit von
+    // Natur aus separiert; nur Kollisionen mit Vias werden noch geprüft.
+    if(!chosen){
+      const clashVia = avoid.some(([wLo, wLa]) =>
+        hav(wLa, wLo, ideal[1], ideal[0]) < MIN_WP_SEPARATION_KM
+      );
+      chosen = clashVia ? (finals[0] ? finals[0].coord : null) : ideal;
+    }
     if(chosen) wps.push(chosen);
   }
 
