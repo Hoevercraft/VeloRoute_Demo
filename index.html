@@ -671,37 +671,68 @@ function surfKey(tags){
   return 'unknown';
 }
 
-// Breakdown (km je Belag) + Geometrie-Segmente [{from,to,key}]
-// für die Belag-Einfärbung. Wird NACH removeBacktracks aufgerufen,
-// damit die Indizes zur bereinigten Geometrie passen.
-function parseBRouterMessages(messages, coords){
+// Koordinaten-Identitätsschlüssel (Mikrograd) — überlebt removeBacktracks,
+// da dort nur Punkte gelöscht (nie verändert) werden.
+function ckey(c){ return Math.round(c[0]*1e6) + ',' + Math.round(c[1]*1e6); }
+
+// Belag-Schlüssel + Risiko-Stufe je Koordinate auf der ORIGINAL-Geometrie
+// bestimmen. Wichtig: VOR removeBacktracks aufrufen — dann sind alle
+// BRouter-Message-Knoten vorhanden und matchIdx trifft exakt (kein Stall).
+// Ergebnis ist eine Map "lonM,latM" → {key, level}, die per Koordinaten-
+// Identität auch nach dem Bereinigen noch greift. Breakdown (km je Belag)
+// kommt wie bisher aus row.distM (unabhängig von der Geometrie).
+function buildSurfaceKeys(messages, coords){
   const rows = msgRows(messages);
-  const breakdown = {}, segs = [], riskSegs = [];
+  const breakdown = {};
+  const N = coords.length;
+  const keyAt = new Array(N).fill(null);
+  const lvlAt = new Array(N).fill('safe');
   let prevIdx = 0;
   for(const row of rows){
     const key = surfKey(row.tags);
+    const level = rowRisk(row.tags).level;
     breakdown[key] = (breakdown[key] || 0) + row.distM / 1000;
     const idx = matchIdx(coords, row.lonM, row.latM, prevIdx);
-    if(idx > prevIdx){
-      const last = segs[segs.length - 1];
-      if(last && last.key === key && last.to === prevIdx) last.to = idx;
-      else segs.push({ from: prevIdx, to: idx, key });
+    const to = Math.max(idx, prevIdx);
+    for(let i = prevIdx; i <= to && i < N; i++){ keyAt[i] = key; lvlAt[i] = level; }
+    prevIdx = to;
+  }
+  // Rest bis Streckenende mit letztem bekannten Wert auffüllen
+  const lastKey = keyAt[prevIdx] || 'unknown', lastLvl = lvlAt[prevIdx] || 'safe';
+  for(let i = 0; i < N; i++){ if(keyAt[i] == null){ keyAt[i] = lastKey; lvlAt[i] = lastLvl; } }
 
-      // Risiko-Outline: nur nicht-sichere Stufen bekommen eine Farbe.
-      // Gleiche Merge-Bedingung (to === prevIdx) wie oben, damit eine
-      // safe-Lücke die farbige Linie sauber unterbricht.
-      const level = rowRisk(row.tags).level;
-      if(RISK[level].color){
-        const lr = riskSegs[riskSegs.length - 1];
-        if(lr && lr.level === level && lr.to === prevIdx) lr.to = idx;
-        else riskSegs.push({ from: prevIdx, to: idx, level });
+  const keyMap = new Map();
+  for(let i = 0; i < N; i++) keyMap.set(ckey(coords[i]), { key: keyAt[i], level: lvlAt[i] });
+  return { breakdown, keyMap };
+}
+
+// Aus der (bereinigten) Geometrie + keyMap die Zeichensegmente bilden.
+// Reine Lauflängen-Kodierung über Koordinaten-Identität → lückenlos,
+// egal welche Punkte removeBacktracks entfernt hat.
+function buildSurfSegs(coords, keyMap){
+  const N = coords.length;
+  const keyArr = new Array(N), lvlArr = new Array(N);
+  for(let i = 0; i < N; i++){
+    const v = keyMap.get(ckey(coords[i])) || { key: 'unknown', level: 'safe' };
+    keyArr[i] = v.key; lvlArr[i] = v.level;
+  }
+  // Grenzen um einen Punkt überlappen lassen (to = nächster Startindex),
+  // sonst bleibt die Verbindungskante zwischen zwei Belägen ungezeichnet.
+  const runsOf = arr => {
+    const out = []; let s = 0;
+    for(let i = 1; i <= N; i++){
+      if(i === N || arr[i] !== arr[s]){
+        out.push({ from: s, to: (i === N ? N - 1 : i), value: arr[s] });
+        s = i;
       }
     }
-    prevIdx = Math.max(prevIdx, idx);
-  }
-  if(prevIdx < coords.length - 1 && segs.length)
-    segs[segs.length - 1].to = coords.length - 1;
-  return { breakdown, segs, riskSegs, rows };
+    return out;
+  };
+  const segs = runsOf(keyArr).map(r => ({ from: r.from, to: r.to, key: r.value }));
+  const riskSegs = runsOf(lvlArr)
+    .filter(r => RISK[r.value] && RISK[r.value].color)
+    .map(r => ({ from: r.from, to: r.to, level: r.value }));
+  return { segs, riskSegs };
 }
 
 // Message-Koordinate (Mikrograd) → Index in der Track-Geometrie.
@@ -1343,12 +1374,18 @@ async function planRoute(){
 // finalen Geometrie — in dieser Reihenfolge, damit die Belag-Segmente
 // zur bereinigten Route passen.
 function finishRoute(feature, viaC){
+  // Belag-Schlüssel auf der ORIGINAL-Geometrie festhalten (alle Message-Knoten
+  // vorhanden → zuverlässig), ERST danach Backtracks entfernen. Die Schlüssel
+  // reisen per Koordinaten-Identität mit → lückenlose Einfärbung.
+  const surf = feature._messages
+    ? buildSurfaceKeys(feature._messages, feature.geometry.coordinates)
+    : null;
   feature.geometry.coordinates = removeBacktracks(feature.geometry.coordinates, viaC);
-  if(feature._messages){
-    const parsed = parseBRouterMessages(feature._messages, feature.geometry.coordinates);
-    feature.properties.surfBreakdown = parsed.breakdown;
-    feature.properties.surfSegs = parsed.segs;
-    feature.properties.riskSegs = parsed.riskSegs;
+  if(surf){
+    const built = buildSurfSegs(feature.geometry.coordinates, surf.keyMap);
+    feature.properties.surfBreakdown = surf.breakdown;
+    feature.properties.surfSegs = built.segs;
+    feature.properties.riskSegs = built.riskSegs;
   }
   return feature;
 }
