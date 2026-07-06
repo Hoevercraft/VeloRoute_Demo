@@ -1360,6 +1360,23 @@ async function planRoute(){
     // Band evtl. nie exakt getroffen → beste Näherung statt letztem Versuch
     feature = best.feature;
 
+    // ── Degenerations-Guard ──
+    // Eine (nahezu) 0-km-Route darf NIE still gerendert werden (führte zu
+    // leerer Karte / Start→Start-GPX ohne Fehler). Tritt sie auf, wird der
+    // Overpass-Pfad umgangen und ein rein geometrischer Ring erzwungen;
+    // scheitert auch der, gibt es eine klare Fehlermeldung.
+    const DEGEN_KM = Math.min(5, effTarget * 0.3);
+    if((feature.properties.summary.distance / 1000) < DEGEN_KM){
+      setStatus('Route unbrauchbar — erzwinge geometrischen Ring…');
+      const gBudget = Math.max(0, waypointCount(effTarget) - viaC.length);
+      const gWps    = geometricWps(S.coord, effTarget, gBudget, viaC);
+      const gPts    = [S.coord, ...sortByBearing([...viaC, ...gWps], S.coord), S.coord];
+      const forced  = finishRoute(await brouterRoute(gPts, S.bike), viaC);
+      if((forced.properties.summary.distance / 1000) < DEGEN_KM)
+        throw new Error('Route konnte nicht erzeugt werden. Bitte Startpunkt leicht verschieben und erneut versuchen.');
+      feature = forced;
+    }
+
     S.route = feature;
     renderRoute(feature);
     showResults(feature);
