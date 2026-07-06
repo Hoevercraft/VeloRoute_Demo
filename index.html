@@ -1275,7 +1275,7 @@ function targetRadiusKm(distKm, n, perim = PERIM_ROAD){
 }
 // Wegpunktzahl skaliert mit Distanz: 30→3 · 70→4 · 120→6 · 180→8
 function waypointCount(distKm){
-  return Math.min(8, Math.max(3, Math.round(distKm / 30) + 2));
+  return Math.min(8, Math.max(4, Math.round(distKm / 30) + 2));
 }
 
 // Geometrischer Wegpunkt-Fallback (Overpass nicht erreichbar):
